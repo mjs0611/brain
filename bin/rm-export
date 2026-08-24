@@ -18,8 +18,10 @@ UUID order and is NOT page order.
 
 import argparse
 import json
+import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +32,18 @@ MIRROR = pathlib.Path(os.environ.get("RM_MIRROR") or (
     / "Library/Application Support/remarkable/desktop"))
 OUT_ROOT = pathlib.Path(os.environ.get("RM_OUT") or (
     pathlib.Path(__file__).resolve().parent.parent / ".brain" / "rm"))
-WIDTH = int(os.environ.get("RM_WIDTH", "1600"))
+SCALE = int(os.environ.get("RM_SCALE", "3"))
+CHROME = os.environ.get("RM_CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def svg_box(svg: pathlib.Path):
+    """(w, h) in CSS px from the SVG's own attributes — pages are not square."""
+    head = svg.read_text(encoding="utf-8", errors="replace")[:2000]
+    w = re.search(r'width="([\d.]+)"', head)
+    h = re.search(r'height="([\d.]+)"', head)
+    if not (w and h):
+        return None
+    return math.ceil(float(w.group(1))), math.ceil(float(h.group(1)))
 
 
 def load():
@@ -96,6 +109,8 @@ def cmd_export(args):
     rmc = shutil.which("rmc")
     if not rmc:
         sys.exit("error: rmc not on PATH (should be provided by the script's deps)")
+    if not pathlib.Path(CHROME).exists():
+        sys.exit(f"error: Chrome not found at {CHROME}. Set RM_CHROME to its binary.")
 
     for d in hits:
         ids = page_ids(d["uid"])
@@ -115,12 +130,22 @@ def cmd_export(args):
                 if r.returncode != 0 or not svg.is_file():
                     print(f"  skip p{n}: rmc failed — {r.stderr.strip()[:120]}", file=sys.stderr)
                     continue
-                # qlmanage is the system rasterizer; avoids a cairo/librsvg install.
-                subprocess.run(["qlmanage", "-t", "-s", str(WIDTH), "-o", tmp, str(svg)],
+                # Headless Chrome, sized to the SVG's own box. qlmanage was tried
+                # first and is wrong here: it emits a SQUARE thumbnail, which crops
+                # the bottom of every portrait page (~7 lines lost per page).
+                box = svg_box(svg)
+                if not box:
+                    print(f"  skip p{n}: could not read SVG dimensions", file=sys.stderr)
+                    continue
+                made = pathlib.Path(tmp) / "shot.png"
+                subprocess.run([CHROME, "--headless", "--disable-gpu",
+                                f"--force-device-scale-factor={SCALE}",
+                                f"--window-size={box[0]},{box[1]}",
+                                "--default-background-color=FFFFFFFF",
+                                f"--screenshot={made}", f"file://{svg}"],
                                capture_output=True)
-                made = pathlib.Path(tmp) / "p.svg.png"
                 if not made.is_file():
-                    print(f"  skip p{n}: qlmanage produced nothing", file=sys.stderr)
+                    print(f"  skip p{n}: Chrome produced nothing", file=sys.stderr)
                     continue
                 shutil.move(str(made), png)
             print(png)
