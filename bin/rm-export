@@ -1,0 +1,155 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rmc>=0.3"]
+# ///
+"""rm-export — pull reMarkable handwriting out of the desktop app's local mirror as PNGs.
+
+The macOS desktop app keeps a full copy of the device's xochitl tree, so nothing
+here touches the cloud API, USB, or SSH. Pages render legibly enough to read
+directly — no OCR step.
+
+    rm-export --list                 # every notebook that has handwriting
+    rm-export "Masters of SCALE"     # -> PNGs, in real page order
+
+Page order comes from .content `cPages.pages[].id`; the directory listing is in
+UUID order and is NOT page order.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MIRROR = pathlib.Path(os.environ.get("RM_MIRROR") or (
+    pathlib.Path.home() / "Library/Containers/com.remarkable.desktop/Data"
+    / "Library/Application Support/remarkable/desktop"))
+OUT_ROOT = pathlib.Path(os.environ.get("RM_OUT") or (
+    pathlib.Path(__file__).resolve().parent.parent / ".brain" / "rm"))
+WIDTH = int(os.environ.get("RM_WIDTH", "1600"))
+
+
+def load():
+    """(folders, docs) — docs are non-deleted DocumentType entries with handwriting."""
+    folders, docs = {}, []
+    if not MIRROR.is_dir():
+        sys.exit(f"error: reMarkable mirror not found at {MIRROR}\n"
+                 "Is the desktop app installed and synced? Override with RM_MIRROR.")
+    metas = []
+    for m in MIRROR.glob("*.metadata"):
+        try:
+            metas.append((m.stem, json.loads(m.read_text())))
+        except (json.JSONDecodeError, OSError):
+            continue
+    for uid, j in metas:
+        if j.get("type") == "CollectionType" and not j.get("deleted"):
+            folders[uid] = j.get("visibleName", "?")
+    for uid, j in metas:
+        if j.get("type") != "DocumentType" or j.get("deleted"):
+            continue
+        if not (MIRROR / uid).is_dir() or not any((MIRROR / uid).glob("*.rm")):
+            continue
+        docs.append({"uid": uid, "name": j.get("visibleName", "?"),
+                     "folder": folders.get(j.get("parent", ""), "루트"),
+                     "modified": int(j.get("lastModified") or 0)})
+    return folders, docs
+
+
+def page_ids(uid):
+    """True page order, falling back to UUID order if .content is unreadable."""
+    try:
+        c = json.loads((MIRROR / f"{uid}.content").read_text())
+        ids = [p["id"] for p in c.get("cPages", {}).get("pages", []) if "id" in p]
+    except (json.JSONDecodeError, OSError, KeyError):
+        ids = []
+    if not ids:
+        return [p.stem for p in sorted((MIRROR / uid).glob("*.rm"))]
+    return [i for i in ids if (MIRROR / uid / f"{i}.rm").is_file()]
+
+
+def cmd_list(args):
+    _, docs = load()
+    for d in sorted(docs, key=lambda d: (d["folder"], -d["modified"])):
+        n = len(page_ids(d["uid"]))
+        annotated = (MIRROR / f"{d['uid']}.pdf").exists()
+        kind = "PDF주석" if annotated else "필기"
+        print(f"[{d['folder']:12s}] {d['name'][:48]:48s} {n:3d}p  {kind}")
+    print(f"\n{len(docs)}개 문서, {sum(len(page_ids(d['uid'])) for d in docs)}페이지", file=sys.stderr)
+
+
+def cmd_export(args):
+    _, docs = load()
+    q = args.name
+    hits = [d for d in docs if d["name"] == q] or [d for d in docs if q.lower() in d["name"].lower()]
+    if not hits:
+        sys.exit(f"error: no notebook matching {q!r}. Try --list.")
+    if len(hits) > 1 and not args.all:
+        print(f"error: {len(hits)} matches — narrow it, or pass --all:", file=sys.stderr)
+        for d in hits:
+            print(f"  [{d['folder']}] {d['name']}", file=sys.stderr)
+        sys.exit(1)
+
+    rmc = shutil.which("rmc")
+    if not rmc:
+        sys.exit("error: rmc not on PATH (should be provided by the script's deps)")
+
+    for d in hits:
+        ids = page_ids(d["uid"])
+        out = pathlib.Path(args.out) if args.out else OUT_ROOT / d["folder"] / d["name"]
+        out.mkdir(parents=True, exist_ok=True)
+        print(f"[{d['folder']}] {d['name']} — {len(ids)}p -> {out}", file=sys.stderr)
+        for n, pid in enumerate(ids, 1):
+            src = MIRROR / d["uid"] / f"{pid}.rm"
+            png = out / f"{n:03d}.png"
+            if png.exists() and not args.force:
+                print(png)
+                continue
+            with tempfile.TemporaryDirectory() as tmp:
+                svg = pathlib.Path(tmp) / "p.svg"
+                r = subprocess.run([rmc, "-t", "svg", str(src), "-o", str(svg)],
+                                   capture_output=True, text=True)
+                if r.returncode != 0 or not svg.is_file():
+                    print(f"  skip p{n}: rmc failed — {r.stderr.strip()[:120]}", file=sys.stderr)
+                    continue
+                # qlmanage is the system rasterizer; avoids a cairo/librsvg install.
+                subprocess.run(["qlmanage", "-t", "-s", str(WIDTH), "-o", tmp, str(svg)],
+                               capture_output=True)
+                made = pathlib.Path(tmp) / "p.svg.png"
+                if not made.is_file():
+                    print(f"  skip p{n}: qlmanage produced nothing", file=sys.stderr)
+                    continue
+                shutil.move(str(made), png)
+            print(png)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="rm-export", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("list", help="list notebooks that contain handwriting")
+    p.set_defaults(func=cmd_list)
+    p = sub.add_parser("export", help="render a notebook's pages to PNG")
+    p.add_argument("name")
+    p.add_argument("-o", "--out", help="output dir (default .brain/rm/<folder>/<name>)")
+    p.add_argument("--all", action="store_true", help="export every fuzzy match")
+    p.add_argument("--force", action="store_true", help="re-render pages that already exist")
+    p.set_defaults(func=cmd_export)
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--list":
+        argv = ["list"]
+    elif argv and argv[0] not in ("list", "export", "-h", "--help"):
+        argv = ["export"] + argv           # `rm-export "이름"` shorthand
+    args = ap.parse_args(argv)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

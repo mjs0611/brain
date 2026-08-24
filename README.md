@@ -46,6 +46,21 @@ cd ~/brain && bin/brain index
 | `brain recall <질의> [-k 8] [--min-score 0.8]` | 의미 검색. 관련 노트 전문 출력 |
 | `brain doctor [--staged]` | visibility↔위치 불변식 검증 |
 
+## 리마커블 필기 가져오기
+
+macOS 데스크톱 앱이 기기 xochitl 트리의 **전체 사본**을 로컬에 갖고 있습니다. 클라우드 API·USB·SSH 전부 불필요합니다.
+
+```bash
+bin/rm-export --list                   # 필기 있는 노트북 목록
+bin/rm-export "Masters of SCALE"       # 페이지 순서대로 PNG
+```
+
+`.rm`(v6) → `rmc`로 SVG → `qlmanage`로 PNG. 필기가 그대로 읽히므로 **OCR도 기기의 Convert to Text도 필요 없습니다.** 출력은 `.brain/rm/<폴더>/<이름>/NNN.png` (gitignore).
+
+- 페이지 순서는 `.content`의 `cPages.pages[].id`에서 옵니다. **디렉터리 나열 순서는 UUID 순이라 페이지 순서가 아닙니다**
+- 기기 폴더가 곧 visibility 힌트입니다. `toss` · `Diary` · `Personal`은 **vault**, `Books` · `Readings` · `Math` · `Physics`는 대체로 public
+- 렌더 실패 페이지는 건너뛰고 stderr에 남깁니다 (rmscene이 최신 포맷 일부를 아직 못 읽음)
+
 ## 두 저장소
 
 | | public `brain` | private `brain-vault` |
