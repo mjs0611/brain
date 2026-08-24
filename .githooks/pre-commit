@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fail closed: if the guard cannot run, the commit does not happen.
+exec "$(git rev-parse --show-toplevel)/bin/brain" doctor --staged

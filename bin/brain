@@ -1,0 +1,408 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["fastembed>=0.7", "numpy>=2.0", "pyyaml>=6.0"]
+# ///
+"""brain — second brain CLI.
+
+Layout (BRAIN_ROOT, default = parent dir of this script's dir):
+    ROOT/notes  ROOT/sources        public repo
+    ROOT/vault/{inbox,notes,sources} private repo, gitignored by parent
+    ROOT/.brain/index.npz            local artifact, gitignored
+
+Invariant enforced by `doctor`: a note's `visibility` always matches which
+repo it physically lives in. Everything else is convention.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
+
+KST = timezone(timedelta(hours=9))
+ROOT = Path(os.environ.get("BRAIN_ROOT") or Path(__file__).resolve().parent.parent)
+VAULT = ROOT / "vault"
+INBOX = VAULT / "inbox"
+DONE = INBOX / "_done"
+INDEX_DIR = ROOT / ".brain"
+INDEX_FILE = INDEX_DIR / "index.npz"
+MANIFEST = INDEX_DIR / "manifest.json"
+
+EMBED_MODEL = os.environ.get("BRAIN_EMBED_MODEL", "intfloat/multilingual-e5-large")
+SOURCE_TYPES = ("book", "article", "conversation", "remarkable", "thought")
+VISIBILITIES = ("public", "vault")
+
+
+# ---------------------------------------------------------------- utilities
+
+def now() -> datetime:
+    return datetime.now(KST)
+
+
+def new_id() -> str:
+    """Sortable, collision-safe, filename-safe. Doubles as the filename prefix."""
+    return f"{now():%Y%m%dT%H%M}-{os.urandom(2).hex()}"
+
+
+def slugify(text: str, limit: int = 50) -> str:
+    text = unicodedata.normalize("NFC", text).strip().lower()
+    text = re.sub(r"[^\w가-힣]+", "-", text, flags=re.UNICODE)
+    return text.strip("-")[:limit] or "untitled"
+
+
+def notes_dir(visibility: str) -> Path:
+    return (ROOT if visibility == "public" else VAULT) / "notes"
+
+
+def all_notes(scope: str = "all") -> list[Path]:
+    dirs = []
+    if scope in ("all", "public"):
+        dirs.append(ROOT / "notes")
+    if scope in ("all", "vault"):
+        dirs.append(VAULT / "notes")
+    return sorted(p for d in dirs if d.is_dir() for p in d.glob("*.md"))
+
+
+def parse_note(path: Path) -> tuple[dict, str]:
+    """Return (frontmatter, body). Missing/!broken frontmatter yields {}."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return {}, text
+    _, _, rest = text.partition("---\n")
+    fm_text, sep, body = rest.partition("\n---\n")
+    if not sep:
+        return {}, text
+    try:
+        fm = yaml.safe_load(fm_text) or {}
+    except yaml.YAMLError:
+        return {}, body
+    return (fm if isinstance(fm, dict) else {}), body.lstrip("\n")
+
+
+def title_of(path: Path, body: str) -> str:
+    for line in body.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return path.stem
+
+
+class _FMDumper(yaml.SafeDumper):
+    """Frontmatter style: lists inline (`tags: [a, b]`), dates unquoted."""
+
+
+_FMDumper.add_representer(
+    list, lambda d, v: d.represent_sequence("tag:yaml.org,2002:seq", v, flow_style=True)
+)
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ capture
+
+def cmd_capture(args) -> None:
+    text = " ".join(args.text).strip()
+    if not text or text == "-":
+        text = "" if text == "-" else text
+        if not sys.stdin.isatty():
+            text = sys.stdin.read().strip()
+    if not text:
+        die("no text. pass as args, pipe to stdin, or use `-`.")
+    INBOX.mkdir(parents=True, exist_ok=True)
+    path = INBOX / f"{now():%Y%m%d-%H%M%S}.md"
+    path.write_text(text + "\n", encoding="utf-8")
+    print(path)
+
+
+# ------------------------------------------------------------------- refine
+
+def cmd_refine(args) -> None:
+    if args.list or not args.file:
+        pending = sorted(p for p in INBOX.glob("*.md"))
+        if not pending:
+            print("inbox empty")
+            return
+        for p in pending:
+            head = p.read_text(encoding="utf-8").strip().replace("\n", " ")[:70]
+            print(f"{p.relative_to(ROOT)}\t{head}")
+        print(f"\n{len(pending)} pending", file=sys.stderr)
+        return
+
+    src = Path(args.file)
+    if not src.is_absolute():
+        src = ROOT / src
+    if not src.is_file():
+        die(f"no such inbox file: {src}")
+    if args.visibility not in VISIBILITIES:
+        die(f"--visibility must be one of {VISIBILITIES}")
+    if args.source_type not in SOURCE_TYPES:
+        die(f"--source-type must be one of {SOURCE_TYPES}")
+
+    body = sys.stdin.read().strip() if args.body == "-" else (args.body or "").strip()
+    if not body:
+        # No body supplied: scaffold from template so the note can be filled in.
+        body = (ROOT / "templates" / "note.md").read_text(encoding="utf-8")
+        body = body.split("\n---\n", 2)[-1].strip()
+        body = body.replace("{{title}}", args.title)
+
+    nid = new_id()
+    fm = {
+        "id": nid,
+        "created": now().date(),
+        "source_type": args.source_type,
+        "source": args.source or "",
+        "tags": [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else [],
+        "visibility": args.visibility,
+        "related": [r.strip() for r in args.related.split(",") if r.strip()] if args.related else [],
+    }
+    if not body.lstrip().startswith("# "):
+        body = f"# {args.title}\n\n{body}"
+
+    dest_dir = notes_dir(args.visibility)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{nid}-{slugify(args.title)}.md"
+    header = yaml.dump(fm, Dumper=_FMDumper, allow_unicode=True, sort_keys=False).strip()
+    dest.write_text(f"---\n{header}\n---\n\n{body.strip()}\n", encoding="utf-8")
+
+    if args.keep:
+        print(f"kept  {src.relative_to(ROOT)}", file=sys.stderr)
+    else:
+        DONE.mkdir(parents=True, exist_ok=True)
+        src.rename(DONE / src.name)
+    print(dest)
+
+
+# ------------------------------------------------------------------- search
+
+def cmd_search(args) -> None:
+    dirs = []
+    if args.scope in ("all", "public"):
+        dirs += [ROOT / "notes", ROOT / "sources"]
+    if args.scope in ("all", "vault"):
+        dirs += [VAULT / "notes", VAULT / "sources"]
+    dirs = [str(d) for d in dirs if d.is_dir()]
+    if not dirs:
+        die("nothing to search")
+    pattern = args.query
+    if args.tag:
+        pattern = rf"^tags:.*\b{re.escape(args.tag)}\b|^\s*-\s*{re.escape(args.tag)}\s*$"
+    cmd = ["rg", "--no-heading", "--line-number", "--color", "never", "-i", pattern, *dirs]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = r.stdout.replace(str(ROOT) + "/", "")
+    print(out.rstrip() or "no match")
+
+
+# -------------------------------------------------------------------- index
+
+def _ensure_hooks() -> None:
+    """Migration convenience: `index` on a fresh clone also arms the leak guard."""
+    hooks = ROOT / ".githooks"
+    if not hooks.is_dir():
+        return
+    for h in hooks.iterdir():
+        h.chmod(0o755)
+    subprocess.run(["git", "-C", str(ROOT), "config", "core.hooksPath", ".githooks"],
+                   capture_output=True)
+
+
+def _embedder():
+    from fastembed import TextEmbedding
+    return TextEmbedding(model_name=EMBED_MODEL)
+
+
+def _payload(path: Path) -> tuple[str, str]:
+    """(hash, embedding input). e5 models expect a `passage: ` prefix on documents."""
+    fm, body = parse_note(path)
+    tags = " ".join(str(t) for t in (fm.get("tags") or []))
+    text = f"{title_of(path, body)}\n{tags}\n{body}"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest(), f"passage: {text}"
+
+
+def cmd_index(args) -> None:
+    import numpy as np
+
+    _ensure_hooks()
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    notes = all_notes("all")
+    if not notes:
+        die("no notes to index")
+
+    old_man, old_vecs = {}, {}
+    if MANIFEST.is_file() and INDEX_FILE.is_file() and not args.rebuild:
+        old_man = json.loads(MANIFEST.read_text())
+        z = np.load(INDEX_FILE, allow_pickle=False)
+        old_vecs = dict(zip(z["paths"].tolist(), z["vectors"]))
+
+    manifest, todo, vectors = {}, [], {}
+    for p in notes:
+        rel = str(p.relative_to(ROOT))
+        digest, text = _payload(p)
+        manifest[rel] = digest
+        if old_man.get(rel) == digest and rel in old_vecs:
+            vectors[rel] = old_vecs[rel]
+        else:
+            todo.append((rel, text))
+
+    if todo:
+        print(f"embedding {len(todo)} note(s) with {EMBED_MODEL} ...", file=sys.stderr)
+        emb = _embedder()
+        for (rel, _), vec in zip(todo, emb.embed([t for _, t in todo])):
+            vectors[rel] = np.asarray(vec, dtype=np.float32)
+
+    paths = sorted(vectors)
+    mat = np.vstack([vectors[p] for p in paths]).astype(np.float32)
+    mat /= np.linalg.norm(mat, axis=1, keepdims=True)  # normalize once, recall is a dot product
+    np.savez_compressed(INDEX_FILE, paths=np.array(paths), vectors=mat)
+    MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=0))
+    print(f"indexed {len(paths)} notes ({len(todo)} new/changed) -> {INDEX_FILE.relative_to(ROOT)}")
+
+
+# ------------------------------------------------------------------- recall
+
+def cmd_recall(args) -> None:
+    import numpy as np
+
+    if not INDEX_FILE.is_file():
+        die("no index. run `brain index` first.")
+    z = np.load(INDEX_FILE, allow_pickle=False)
+    paths, mat = z["paths"].tolist(), z["vectors"]
+
+    qvec = np.asarray(next(iter(_embedder().embed([f"query: {args.query}"]))), dtype=np.float32)
+    qvec /= np.linalg.norm(qvec)
+    scores = mat @ qvec
+
+    keep = [i for i in np.argsort(-scores) if scores[i] >= args.min_score]
+    if args.scope != "all":
+        want_vault = args.scope == "vault"
+        keep = [i for i in keep if paths[i].startswith("vault/") == want_vault]
+    keep = keep[: args.k]
+    if not keep:
+        print("no note above threshold")
+        return
+
+    for i in keep:
+        path = ROOT / paths[i]
+        fm, body = parse_note(path)
+        vis = fm.get("visibility", "?")
+        print(f"\n{'=' * 70}\n[{scores[i]:.3f}] {title_of(path, body)}  ({vis})")
+        print(f"path: {paths[i]}  id: {fm.get('id', '?')}  tags: {', '.join(map(str, fm.get('tags') or []))}")
+        print(f"source: {fm.get('source') or '-'}\n{'-' * 70}")
+        print(body.strip())
+
+
+# ------------------------------------------------------------------- doctor
+
+def _violations_in(path: Path, text: str) -> list[str]:
+    """A note under the public tree must not declare, or read as, vault content."""
+    bad = []
+    if re.search(r"^visibility:\s*vault\s*$", text, re.M):
+        bad.append(f"{path}: visibility: vault inside the public repo")
+    return bad
+
+
+def cmd_doctor(args) -> None:
+    problems = []
+
+    if args.staged:
+        r = subprocess.run(["git", "-C", str(ROOT), "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
+                           capture_output=True, text=True)
+        for rel in r.stdout.split():
+            if rel.startswith("vault/"):
+                problems.append(f"{rel}: vault path staged in the public repo")
+                continue
+            if not rel.endswith(".md"):
+                continue
+            blob = subprocess.run(["git", "-C", str(ROOT), "show", f":{rel}"],
+                                  capture_output=True, text=True).stdout
+            problems += _violations_in(Path(rel), blob)
+    else:
+        for p in all_notes("all"):
+            fm, body = parse_note(p)
+            rel = p.relative_to(ROOT)
+            expected = "vault" if VAULT in p.parents else "public"
+            if not fm:
+                problems.append(f"{rel}: missing or invalid frontmatter")
+                continue
+            if fm.get("visibility") != expected:
+                problems.append(f"{rel}: visibility={fm.get('visibility')!r} but lives in the {expected} repo")
+            for field in ("id", "created", "source_type", "visibility"):
+                if not fm.get(field):
+                    problems.append(f"{rel}: missing `{field}`")
+            if fm.get("source_type") not in SOURCE_TYPES:
+                problems.append(f"{rel}: source_type={fm.get('source_type')!r} not in {SOURCE_TYPES}")
+            if not body.lstrip().startswith("# "):
+                problems.append(f"{rel}: body has no `# title` heading")
+
+    if problems:
+        print("VAULT LEAK / SCHEMA CHECK FAILED", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        sys.exit(1)
+    print("ok" if not args.staged else "ok (staged)")
+
+
+# --------------------------------------------------------------------- main
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="brain", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("capture", help="drop raw text into the vault inbox")
+    p.add_argument("text", nargs="*")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("refine", help="turn an inbox item into a note (plumbing only)")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--title", default="")
+    p.add_argument("--visibility", default="public", choices=VISIBILITIES)
+    p.add_argument("--source-type", default="thought", choices=SOURCE_TYPES)
+    p.add_argument("--source", default="")
+    p.add_argument("--tags", default="")
+    p.add_argument("--related", default="")
+    p.add_argument("--body", default="", help="note body, or `-` to read stdin")
+    p.add_argument("--keep", action="store_true", help="leave the inbox file in place")
+    p.set_defaults(func=cmd_refine)
+
+    p = sub.add_parser("search", help="keyword / tag search")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--tag")
+    p.add_argument("--scope", default="all", choices=["all", "public", "vault"])
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("index", help="build or refresh the embedding index")
+    p.add_argument("--rebuild", action="store_true", help="ignore the manifest, re-embed everything")
+    p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("recall", help="semantic search; prints notes for Claude to synthesize")
+    p.add_argument("query")
+    p.add_argument("-k", type=int, default=8)
+    # e5 cosine scores sit in a narrow ~0.75-0.90 band, so this floor only cuts
+    # obvious noise; `-k` is the real control.
+    p.add_argument("--min-score", type=float, default=0.78)
+    p.add_argument("--scope", default="all", choices=["all", "public", "vault"])
+    p.set_defaults(func=cmd_recall)
+
+    p = sub.add_parser("doctor", help="verify the visibility/location invariant")
+    p.add_argument("--staged", action="store_true", help="pre-commit mode: check the git index")
+    p.set_defaults(func=cmd_doctor)
+
+    args = ap.parse_args()
+    if args.cmd == "refine" and args.file and not args.title:
+        die("--title is required when refining a file")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
