@@ -107,6 +107,15 @@ related: [20260812T0930-b1c2]
 public repo는 GitHub 커넥터로 그냥 읽힙니다. vault는 private repo 접근 권한이 필요합니다.
 `recall`(임베딩 검색)은 로컬 명령이라 **Claude Code에서만** 동작합니다. 앱에서는 파일 브라우징과 키워드 검색까지입니다.
 
-## 자동화 (맥미니 이전 후)
+## 자동화 — 리마커블 매일 정제
 
-`index`는 증분·멱등이라 cron에 그대로 걸립니다. `refine --list`가 미처리 건수를 stderr로 뱉으므로 정제 리마인드도 여기에 붙습니다.
+`bin/rm-daily`가 매일 06:30(launchd) 리마커블 `Personal` 폴더에서 새로 쓰거나 고친 페이지만 골라 `vault/inbox`에 넣고, 헤드리스 Claude가 노트 초안을 만들고 재색인합니다. **커밋은 하지 않습니다** — 아침에 두 repo의 `git status`로 검토하고 커밋하세요. 로그 `.brain/rm-daily.log`.
+
+```bash
+cp launchd/com.june.brain-rm-daily.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.june.brain-rm-daily.plist
+```
+
+- 변경 판정은 `.rm` 내용 해시(`.brain/rm-seen.json`). mtime은 앱 재동기화 때 전부 새로 찍혀서 못 씀
+- 미러는 데스크톱 앱이 떠 있을 때만 갱신 — 러너가 앱을 띄우고 `RM_SYNC_WAIT`(기본 120초) 기다림
+- 인증은 `~/.config/claude-cron-token`(`claude setup-token`). launchd는 키체인을 못 읽음

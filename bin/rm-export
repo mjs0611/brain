@@ -17,6 +17,7 @@ UUID order and is NOT page order.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 MIRROR = pathlib.Path(os.environ.get("RM_MIRROR") or (
     pathlib.Path.home() / "Library/Containers/com.remarkable.desktop/Data"
@@ -151,6 +153,91 @@ def cmd_export(args):
             print(png)
 
 
+STATE = OUT_ROOT.parent / "rm-seen.json"   # {page_id: sha1 of .rm} of pages already sent to inbox
+INBOX = pathlib.Path(os.environ.get("BRAIN_ROOT") or pathlib.Path(__file__).resolve().parent.parent) / "vault" / "inbox"
+
+
+# rmc's palette omits HIGHLIGHT (id 9) and any newer Paper Pro colors -> KeyError on
+# the whole page. Run rmc in-process with a palette that falls back instead of dying.
+RMC_SHIM = """
+import sys, rmc.exporters.writing_tools as w
+class P(dict):
+    def __missing__(self, k): return (251, 247, 25) if k == 9 else (144, 144, 144)
+w.RM_PALETTE = P(w.RM_PALETTE)
+from rmc.cli import cli
+sys.argv[0] = "rmc"; cli()
+"""
+
+
+def render(src: pathlib.Path, png: pathlib.Path) -> bool:
+    with tempfile.TemporaryDirectory() as tmp:
+        svg = pathlib.Path(tmp) / "p.svg"
+        r = subprocess.run([sys.executable, "-c", RMC_SHIM, "-t", "svg", str(src), "-o", str(svg)],
+                           capture_output=True, text=True)
+        box = svg_box(svg) if r.returncode == 0 and svg.is_file() else None
+        if not box:
+            print(f"  skip {src.name}: rmc failed — {r.stderr.strip()[:120]}", file=sys.stderr)
+            return False
+        made = pathlib.Path(tmp) / "shot.png"
+        subprocess.run([CHROME, "--headless", "--disable-gpu", f"--force-device-scale-factor={SCALE}",
+                        f"--window-size={box[0]},{box[1]}", "--default-background-color=FFFFFFFF",
+                        f"--screenshot={made}", f"file://{svg}"], capture_output=True)
+        if not made.is_file():
+            print(f"  skip {src.name}: Chrome produced nothing", file=sys.stderr)
+            return False
+        png.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(made), png)
+    return True
+
+
+def cmd_changed(args):
+    """New or edited pages in --folder -> PNGs + one inbox file per notebook.
+
+    State is {page id: sha1 of .rm}. Not digest: the desktop app rewrites every
+    .rm's digest when it resyncs (whole mirror stamped 2026-09-21 23:52), which
+    would resend everything. Page id, not number, so mid-notebook inserts are safe.
+    --seed marks pages whose old numbered PNG (NNN.png) exists as already sent.
+    """
+    _, docs = load()
+    docs = [d for d in docs if d["folder"] == args.folder]
+    if not args.seed and not pathlib.Path(CHROME).exists():
+        sys.exit(f"error: Chrome not found at {CHROME}. Set RM_CHROME to its binary.")
+    seen =json.loads(STATE.read_text()) if STATE.is_file() else {}
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    made = 0
+    for d in docs:
+        out = OUT_ROOT / d["folder"] / d["name"]
+        fresh = []
+        for n, pid in enumerate(page_ids(d["uid"]), 1):
+            src = MIRROR / d["uid"] / f"{pid}.rm"
+            digest = hashlib.sha1(src.read_bytes()).hexdigest()
+            if args.seed:
+                if (out / f"{n:03d}.png").exists():
+                    seen[pid] = digest
+                continue
+            if seen.get(pid) == digest:
+                continue
+            png = out / f"{n:03d}-{pid[:8]}.png"
+            if render(src, png):
+                fresh.append((n, pid, digest, png))
+        if not fresh:
+            continue
+        INBOX.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^\w가-힣]+", "-", d["name"]).strip("-")
+        note = INBOX / f"{stamp}-rm-{slug}.md"
+        note.write_text(
+            f"리마커블 필기 — [{d['folder']}] {d['name']} (source_type: remarkable)\n\n"
+            "새로 쓰거나 고친 페이지. PNG를 Read로 직접 읽을 것.\n\n"
+            + "".join(f"- p{n}: {png}\n" for n, _, _, png in fresh), encoding="utf-8")
+        for _, pid, digest, _ in fresh:     # mark seen only once the inbox file exists
+            seen[pid] = digest
+        made += 1
+        print(note)
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(seen, indent=0))
+    print(f"seeded {len(seen)} pages" if args.seed else f"{made} inbox files", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="rm-export", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -163,11 +250,15 @@ def main():
     p.add_argument("--all", action="store_true", help="export every fuzzy match")
     p.add_argument("--force", action="store_true", help="re-render pages that already exist")
     p.set_defaults(func=cmd_export)
+    p = sub.add_parser("changed", help="new/edited pages in a folder -> vault/inbox")
+    p.add_argument("--folder", default="Personal")
+    p.add_argument("--seed", action="store_true", help="mark already-exported pages as seen, render nothing")
+    p.set_defaults(func=cmd_changed)
 
     argv = sys.argv[1:]
     if argv and argv[0] == "--list":
         argv = ["list"]
-    elif argv and argv[0] not in ("list", "export", "-h", "--help"):
+    elif argv and argv[0] not in ("list", "export", "changed", "-h", "--help"):
         argv = ["export"] + argv           # `rm-export "이름"` shorthand
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):

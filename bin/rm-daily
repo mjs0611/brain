@@ -1,0 +1,37 @@
+#!/bin/zsh
+# rm-daily — 리마커블 Personal 새 페이지 -> vault/inbox -> Claude 정제 초안 -> 재색인.
+# 커밋은 하지 않는다. June이 `git status`(brain·vault 둘 다)로 검토 후 커밋.
+# launchd: ~/Library/LaunchAgents/com.june.brain-rm-daily.plist
+cd "${0:A:h:h}" || exit 1
+mkdir -p .brain
+LOG=.brain/rm-daily.log
+exec >>"$LOG" 2>&1
+echo "===== $(date '+%F %T') ====="
+export PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH
+
+# 미러는 데스크톱 앱이 떠 있을 때만 갱신된다. 실측: 실행 후 30초 안에 동기화(2026-10-16)
+if ! pgrep -xq reMarkable; then
+  open -g -a reMarkable && sleep ${RM_SYNC_WAIT:-120}
+fi
+
+new=("${(@f)$(bin/rm-export changed --folder ${RM_FOLDER:-Personal})}") || { echo "rm-export failed"; exit 1; }
+new=(${new:#})
+(( ${#new} )) || { echo "no new pages"; exit 0; }
+
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+# launchd도 키체인을 못 읽는다 — toss-guard와 같은 setup-token 파일
+[ -r "$HOME/.config/claude-cron-token" ] && export CLAUDE_CODE_OAUTH_TOKEN=$(<"$HOME/.config/claude-cron-token")
+export ECC_GATEGUARD=off   # 사실 확인 게이트가 헤드리스 첫 Bash를 막는다
+
+claude -p "$(<templates/rm-refine-prompt.md)
+${(F)new}" \
+  --model ${RM_MODEL:-claude-opus-5-5} \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --allowedTools Read "Bash(bin/brain:*)" \
+  --disallowedTools "Bash(git commit:*)" "Bash(git push:*)" "Bash(git reset:*)" "Bash(git checkout:*)" "Write" "Edit"
+  # settings.json defaultMode=auto라 allowedTools만으론 안 막힌다(2026-10-16 실측). 커밋 금지는 deny로 강제
+echo "claude exit $?"
+
+bin/brain index
+left=(vault/inbox/*-rm-*.md(N))
+osascript -e "display notification \"새 페이지 ${#new}권 정제 초안 · inbox 남음 ${#left} — git status로 검토\" with title \"brain\"" 2>/dev/null
