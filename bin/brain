@@ -189,6 +189,14 @@ def cmd_refine(args) -> None:
     else:
         DONE.mkdir(parents=True, exist_ok=True)
         src.rename(DONE / src.name)
+        # Typed inbox notes get [[linked]] from Obsidian before they're refined.
+        # Moving the file outside Obsidian would orphan those links, so repoint them.
+        old = re.compile(r"\[\[" + re.escape(src.stem) + r"(?=[\]|#])")
+        for p in all_notes("all") + sorted(INBOX.glob("*.md")):
+            text = p.read_text(encoding="utf-8")
+            if old.search(text):
+                p.write_text(old.sub("[[" + dest.stem, text), encoding="utf-8")
+                print(f"relinked {p.relative_to(ROOT)}", file=sys.stderr)
     print(dest)
 
 
@@ -312,16 +320,31 @@ def cmd_recall(args) -> None:
 
 # ------------------------------------------------------------------- doctor
 
-def _violations_in(path: Path, text: str) -> list[str]:
-    """A note under the public tree must not declare, or read as, vault content."""
+WIKILINK = re.compile(r"\[\[([^\]|#]+)")
+
+
+def _vault_stems() -> set[str]:
+    return {p.stem for p in VAULT.rglob("*.md")} if VAULT.is_dir() else set()
+
+
+def _violations_in(path: Path, text: str, vault_stems: set[str]) -> list[str]:
+    """A note under the public tree must not declare, read as, or link to vault content.
+
+    Links count: the target filename is a claim sentence, so `[[vault note]]` in a
+    public note leaks the private title even though the body stays private.
+    """
     bad = []
     if re.search(r"^visibility:\s*vault\s*$", text, re.M):
         bad.append(f"{path}: visibility: vault inside the public repo")
+    for target in WIKILINK.findall(text):
+        if Path(target.strip()).stem in vault_stems:
+            bad.append(f"{path}: links to vault note [[{target.strip()}]]")
     return bad
 
 
 def cmd_doctor(args) -> None:
     problems = []
+    vault_stems = _vault_stems()
 
     if args.staged:
         r = subprocess.run(["git", "-C", str(ROOT), "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
@@ -334,7 +357,7 @@ def cmd_doctor(args) -> None:
                 continue
             blob = subprocess.run(["git", "-C", str(ROOT), "show", f":{rel}"],
                                   capture_output=True, text=True).stdout
-            problems += _violations_in(Path(rel), blob)
+            problems += _violations_in(Path(rel), blob, vault_stems)
     else:
         for p in all_notes("all"):
             fm, body = parse_note(p)
@@ -352,6 +375,8 @@ def cmd_doctor(args) -> None:
                 problems.append(f"{rel}: source_type={fm.get('source_type')!r} not in {SOURCE_TYPES}")
             if not body.lstrip().startswith("# "):
                 problems.append(f"{rel}: body has no `# title` heading")
+            if expected == "public":
+                problems += [x for x in _violations_in(rel, body, vault_stems) if "links to vault" in x]
 
     if problems:
         print("VAULT LEAK / SCHEMA CHECK FAILED", file=sys.stderr)
@@ -376,7 +401,7 @@ def main() -> None:
     p.add_argument("file", nargs="?")
     p.add_argument("--list", action="store_true")
     p.add_argument("--title", default="")
-    p.add_argument("--visibility", default="public", choices=VISIBILITIES)
+    p.add_argument("--visibility", default="vault", choices=VISIBILITIES)  # public is an explicit choice
     p.add_argument("--source-type", default="thought", choices=SOURCE_TYPES)
     p.add_argument("--source", default="")
     p.add_argument("--tags", default="")

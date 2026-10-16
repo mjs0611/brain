@@ -44,6 +44,17 @@ EOF
 
 **visibility 판정:** 회사 업무 내부 정보 / 개인사 / 금융은 **애매하면 무조건 `vault`**. 판단이 서지 않으면 vault입니다.
 
+## 타이핑 입력 (Obsidian)
+
+맥미니에서 `~/brain` 전체를 Obsidian 보관함 하나로 엽니다. 새 노트는 `vault/inbox/`에 생깁니다(`.obsidian/app.json`). 아이폰은 쓰지 않고, 맥북은 git으로 맞춥니다.
+
+- inbox 글은 형식이 자유입니다. frontmatter를 요구하지 마세요. inbox에 있는 동안에도 검색·링크 대상입니다
+- June이 "inbox 정리해줘"라고 하면: 이미 주장 하나로 완성된 글은 **본문을 고치지 말고** `refine`으로 id·frontmatter·위치만 처리합니다. 여러 생각이 섞인 글만 쪼갭니다
+- `refine` 기본 visibility는 `vault`입니다. public은 June이 정할 때만 씁니다
+- `refine`이 inbox 파일을 옮기면 그 파일을 가리키던 `[[링크]]`를 새 노트로 바꿔 줍니다
+
+**링크:** 연결의 정본은 본문의 `[[파일명|표시 문구]]`입니다. 왜 연결했는지를 문장으로 씁니다. recall 결과를 링크로 자동 추가하지 마세요 — 비슷한 것과 의미 있게 연결된 것은 다릅니다. **public 노트에서 vault 노트로 링크하면 doctor가 실패합니다**(파일명이 곧 비공개 제목이라). vault → public은 괜찮습니다.
+
 ## 리마커블 필기에서 노트 만들 때
 
 `bin/rm-export "<노트북 이름>"`으로 PNG를 뽑고 Read로 직접 읽습니다. 필기가 그대로 읽히므로 OCR을 붙이지 마세요.

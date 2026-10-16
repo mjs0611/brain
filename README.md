@@ -107,6 +107,10 @@ related: [20260812T0930-b1c2]
 public repo는 GitHub 커넥터로 그냥 읽힙니다. vault는 private repo 접근 권한이 필요합니다.
 `recall`(임베딩 검색)은 로컬 명령이라 **Claude Code에서만** 동작합니다. 앱에서는 파일 브라우징과 키워드 검색까지입니다.
 
+## 타이핑 — Obsidian
+
+맥미니에서 Obsidian으로 `~/brain` 폴더를 보관함으로 엽니다(`brew install --cask obsidian`). 새 노트는 `vault/inbox/`로, 노트끼리는 `[[`로 연결합니다. 정리는 Claude Code에서 "inbox 정리해줘". 맥북은 두 repo를 clone해 같은 방식으로 열고 git pull/push로 맞춥니다. `.obsidian/`은 기기별 설정이라 gitignore.
+
 ## 자동화 — 리마커블 매일 정제
 
 `bin/rm-daily`가 매일 06:30(launchd) 리마커블 `Personal` 폴더에서 새로 쓰거나 고친 페이지만 골라 `vault/inbox`에 넣고, 헤드리스 Claude가 노트 초안을 만들고 재색인합니다. **커밋은 하지 않습니다** — 아침에 두 repo의 `git status`로 검토하고 커밋하세요. 로그 `.brain/rm-daily.log`.

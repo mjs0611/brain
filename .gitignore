@@ -2,3 +2,4 @@ vault/
 .brain/
 .DS_Store
 __pycache__/
+.obsidian/
