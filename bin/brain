@@ -34,6 +34,11 @@ INBOX = VAULT / "inbox"
 DONE = INBOX / "_done"
 INDEX_DIR = ROOT / ".brain"
 INDEX_FILE = INDEX_DIR / "index.npz"
+# Optional local ONNX of nlpai-lab/KURE-Reranker-nano; the repo ships none, so convert once:
+#   uv run --with "optimum-onnx[onnxruntime]" --with torch optimum-cli export onnx \
+#     --model nlpai-lab/KURE-Reranker-nano --task text-classification .brain/kure-onnx
+RERANK_MODEL = "nlpai-lab/KURE-Reranker-nano"
+RERANK_DIR = INDEX_DIR / "kure-onnx"
 MANIFEST = INDEX_DIR / "manifest.json"
 
 EMBED_MODEL = os.environ.get("BRAIN_EMBED_MODEL", "intfloat/multilingual-e5-large")
@@ -238,12 +243,23 @@ def _embedder():
     return TextEmbedding(model_name=EMBED_MODEL)
 
 
-def _payload(path: Path) -> tuple[str, str]:
-    """(hash, embedding input). e5 models expect a `passage: ` prefix on documents."""
+def _note_text(path: Path) -> str:
     fm, body = parse_note(path)
     tags = " ".join(str(t) for t in (fm.get("tags") or []))
-    text = f"{title_of(path, body)}\n{tags}\n{body}"
+    return f"{title_of(path, body)}\n{tags}\n{body}"
+
+
+def _payload(path: Path) -> tuple[str, str]:
+    """(hash, embedding input). e5 models expect a `passage: ` prefix on documents."""
+    text = _note_text(path)
     return hashlib.sha256(text.encode("utf-8")).hexdigest(), f"passage: {text}"
+
+
+def _reranker():
+    from fastembed.common.model_description import ModelSource
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+    TextCrossEncoder.add_custom_model(model=RERANK_MODEL, sources=ModelSource(hf=RERANK_MODEL), model_file="model.onnx")
+    return TextCrossEncoder(RERANK_MODEL, specific_model_path=str(RERANK_DIR))
 
 
 def cmd_index(args) -> None:
@@ -299,11 +315,22 @@ def cmd_recall(args) -> None:
     qvec /= np.linalg.norm(qvec)
     scores = mat @ qvec
 
-    keep = [i for i in np.argsort(-scores) if scores[i] >= args.min_score]
+    keep = np.argsort(-scores).tolist()
     if args.scope != "all":
         want_vault = args.scope == "vault"
         keep = [i for i in keep if paths[i].startswith("vault/") == want_vault]
-    keep = keep[: args.k]
+
+    if (RERANK_DIR / "model.onnx").is_file():
+        # e5 alone can't separate off-topic queries (best off-topic 0.830 > worst hit 0.813);
+        # KURE logits can: off-topic <= -6.2, hits >= -3.5, so -5.0 (measured 2026-10-17).
+        floor = -5.0 if args.min_score is None else args.min_score
+        keep = keep[: max(args.k, 10)]
+        rr = list(_reranker().rerank(args.query, [_note_text(ROOT / paths[i]) for i in keep], batch_size=8))
+        scores = dict(zip(keep, rr))
+        keep = sorted(keep, key=lambda i: -scores[i])
+    else:
+        floor = 0.80 if args.min_score is None else args.min_score
+    keep = [i for i in keep if scores[i] >= floor][: args.k]
     if not keep:
         print("no note above threshold")
         return
@@ -423,9 +450,8 @@ def main() -> None:
     p = sub.add_parser("recall", help="semantic search; prints notes for Claude to synthesize")
     p.add_argument("query")
     p.add_argument("-k", type=int, default=8)
-    # e5 cosine scores sit in a narrow ~0.75-0.90 band, so this floor only cuts
-    # obvious noise; `-k` is the real control.
-    p.add_argument("--min-score", type=float, default=0.78)
+    # Default -5.0 on KURE rerank logits, or 0.80 on e5 cosine when .brain/kure-onnx is absent.
+    p.add_argument("--min-score", type=float, default=None)
     p.add_argument("--scope", default="all", choices=["all", "public", "vault"])
     p.set_defaults(func=cmd_recall)
 
