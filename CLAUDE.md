@@ -7,6 +7,7 @@
 - `notes/` — public 노트. 1노트 = 1인사이트, 본문 300~800자, 플랫 구조(폴더 분류 없음, 태그로 분류)
 - `sources/` — 출처 단위 메타(책·아티클). 선택적
 - `vault/` — **private repo**(`brain-vault`)가 중첩돼 있고 부모가 gitignore 중. 회사 내부정보·개인사·금융은 전부 여기
+- `vault/journal/`·`vault/pages/` — Roam·Reflect에서 합친 데일리(`MMMM Do, YYYY`)와 페이지. 이제 Obsidian이 원본이고 데일리 노트도 여기 쌓입니다. 노트 규격·index·recall 대상 아님
 - `vault/inbox/` — 정제 전 캡처. **모든 캡처는 항상 여기로 떨어집니다**(기본값 private)
 - `bin/brain` — CLI. `uv run` 셔뱅이라 별도 설치 불필요
 
